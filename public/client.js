@@ -9,7 +9,7 @@ let view = null;
 let selected = new Set();
 let everSawOpponent = false;
 let bigCardsOn = false;
-const CLIENT_BUILD = '2026-10-09.13'; // bei jeder Auslieferung mit server.js VERSION mitziehen
+const CLIENT_BUILD = '2026-10-09.15'; // bei jeder Auslieferung mit server.js VERSION mitziehen
 let serverBuild = null;
 let watching = null;       // Raumcode, den wir nur beobachten (Zuschauer-Modus), sonst null
 let serverVapidKey = null; // oeffentlicher VAPID-Schluessel des Servers (fuer Web-Push)
@@ -200,6 +200,9 @@ function handleMessage(msg) {
     const prev = view;
     view = msg.view;
     everSawOpponent = everSawOpponent || view.opponentConnected;
+    if (!watching) document.getElementById('btnCopyLink').style.display = view.oppIsBot ? 'none' : ''; // gegen den Computer gibt es nichts zu teilen
+    clockRecv = view.clock ? { remaining: view.clock.remaining.slice(), running: view.clock.running, at: performance.now() } : null;
+    renderClocks();
     render();
     onViewChange(prev, view);
   } else if (msg.type === 'roomList') {
@@ -318,8 +321,85 @@ document.getElementById('btnWatch').addEventListener('click', () => {
 document.getElementById('btnCreate').addEventListener('click', () => {
   setLobbyStatus('Erstelle Raum …');
   rejoining = false;
-  ensureConnected(() => send({ type: 'create', name: currentName() }));
+  ensureConnected(() => send({ type: 'create', name: currentName(), settings: lobbySettings() }));
 });
+
+/* ---------- Lobby-Einstellungen: Bedenkzeit (Fischer) und Vorgabe ---------- */
+function lobbySettings() {
+  const sel = document.getElementById('optClock').value;
+  let minutes = 0, increment = 0;
+  if (sel === 'custom') {
+    minutes = Number(document.getElementById('optMin').value) || 0;
+    increment = Number(document.getElementById('optInc').value) || 0;
+  } else if (sel) {
+    const [m, i] = sel.split('+').map(Number);
+    minutes = m; increment = i;
+  }
+  const hc = id => Math.round(Number(document.getElementById(id).value) || 0);
+  const out = { minutes, increment, handicap: [hc('optHcMe'), hc('optHcOpp')] };
+  try { localStorage.setItem('peseqind_settings', JSON.stringify({ sel, min: document.getElementById('optMin').value, inc: document.getElementById('optInc').value, h: out.handicap })); } catch (e) { /* egal */ }
+  return out;
+}
+(function restoreLobbySettings() {
+  try {
+    const st = JSON.parse(localStorage.getItem('peseqind_settings') || 'null');
+    if (st) {
+      document.getElementById('optClock').value = st.sel || '';
+      if (st.min) document.getElementById('optMin').value = st.min;
+      if (st.inc !== undefined) document.getElementById('optInc').value = st.inc;
+      if (st.h) { document.getElementById('optHcMe').value = st.h[0] || 0; document.getElementById('optHcOpp').value = st.h[1] || 0; }
+    }
+  } catch (e) { /* egal */ }
+  const upd = () => { document.getElementById('optCustom').style.display = document.getElementById('optClock').value === 'custom' ? '' : 'none'; };
+  document.getElementById('optClock').addEventListener('change', upd);
+  upd();
+})();
+
+/* ---------- Uhr-Anzeige: zaehlt lokal zwischen den Server-Updates herunter ---------- */
+let clockRecv = null; // { remaining:[ms,ms], running, at }
+function fmtClock(ms) {
+  ms = Math.max(0, ms);
+  const tot = Math.ceil(ms / 1000);
+  if (ms < 10000) return (ms / 1000).toFixed(1).replace('.', ',') + ' s';
+  return Math.floor(tot / 60) + ':' + String(tot % 60).padStart(2, '0');
+}
+function renderClocks() {
+  const me = document.getElementById('meClock'), op = document.getElementById('oppClock');
+  if (!view || !view.clock || !clockRecv) { me.style.display = 'none'; op.style.display = 'none'; return; }
+  const myIdx = view.myIndex, oppIdx = myIdx === 0 ? 1 : 0;
+  const left = i => clockRecv.remaining[i] - (clockRecv.running === i ? performance.now() - clockRecv.at : 0);
+  [[me, myIdx], [op, oppIdx]].forEach(([el, i]) => {
+    const ms = left(i);
+    el.style.display = '';
+    el.textContent = '⏱ ' + fmtClock(ms);
+    el.classList.toggle('running', clockRecv.running === i);
+    el.classList.toggle('low', ms < 30000);
+  });
+}
+setInterval(renderClocks, 200);
+
+function settingsSummary(st) {
+  if (!st) return '';
+  const parts = [];
+  if (st.clock) parts.push(`⏱ ${st.clock.baseMs / 60000} Min + ${st.clock.incMs / 1000} s`);
+  const [a, b] = st.handicap || [0, 0];
+  if (a || b) parts.push(`Vorgabe ${a >= 0 ? '+' : ''}${a} / ${b >= 0 ? '+' : ''}${b}`);
+  return parts.join(' · ');
+}
+
+document.getElementById('btnResign').addEventListener('click', () => {
+  if (!view || view.spectator) return;
+  if (view.roundOver && view.pendingWinner !== null) return;
+  if (!confirm('Wirklich aufgeben? Das Spiel endet sofort und ' + (view.oppName || 'dein Gegner') + ' gewinnt.')) return;
+  document.getElementById('dropMenu').classList.remove('open');
+  sendAction('resign');
+});
+
+document.querySelectorAll('[data-bot]').forEach(btn => btn.addEventListener('click', () => {
+  setLobbyStatus('Starte Spiel gegen den Computer …');
+  rejoining = false;
+  ensureConnected(() => send({ type: 'create', name: currentName(), bot: btn.dataset.bot, settings: lobbySettings() }));
+}));
 
 document.getElementById('btnJoin').addEventListener('click', () => {
   const code = document.getElementById('joinCodeInput').value.trim().toUpperCase();
@@ -1093,7 +1173,8 @@ function renderHistory() {
     rows += `<tr><td>Gesamt</td><td>${view.scores[view.myIndex]}</td><td>${view.scores[view.myIndex === 0 ? 1 : 0]}</td></tr>`;
   }
   document.getElementById('historyTable').innerHTML = `<tr><th>Runde</th><th>${escapeHtml(meName())}</th><th>${escapeHtml(view.oppName)}</th></tr>${rows}`;
-  document.getElementById('dropHistoryTitle').textContent = `Punkteverlauf · Runde ${view.round} · Ziel 500`;
+  const sum = settingsSummary(view.settings);
+  document.getElementById('dropHistoryTitle').textContent = `Punkteverlauf · Runde ${view.round} · Ziel 500${sum ? ' · ' + sum : ''}`;
   renderTableNow();
 }
 
@@ -1175,8 +1256,15 @@ function renderRoundOverlay() {
   });
 
   const winner = view.pendingWinner;
+  const resigned = view.resigned;
+  const timedOut = view.timedOut;
+  const who = i => (i === me ? (view.spectator ? view.myName : 'Du') : view.oppName);
+  document.getElementById('roundTitle').textContent =
+    timedOut !== null && timedOut !== undefined ? `Zeit abgelaufen – ${who(timedOut)} ${timedOut === me && !view.spectator ? 'hast' : 'hat'} verloren`
+    : resigned !== null && resigned !== undefined ? (resigned === me && !view.spectator ? 'Du hast aufgegeben' : `${resigned === me ? view.myName : view.oppName} hat aufgegeben`)
+    : 'Runde beendet';
   document.getElementById('roundContinueBtn').textContent =
-    winner !== null ? `${winner === me && !view.spectator ? 'Du gewinnst' : (winner === me ? view.myName : view.oppName) + ' gewinnt'} mit ${view.scores[winner]} Punkten – Neues Spiel` : 'Nächste Runde';
+    winner !== null ? `${winner === me && !view.spectator ? 'Du gewinnst' : (winner === me ? view.myName : view.oppName) + ' gewinnt'}${(resigned === null || resigned === undefined) && (timedOut === null || timedOut === undefined) ? ` mit ${view.scores[winner]} Punkten` : ''} – Neues Spiel` : 'Nächste Runde';
   document.getElementById('roundContinueBtn').style.display = view.spectator ? 'none' : '';
   overlay.classList.add('visible');
   overlay.scrollTop = prevTop;
@@ -1190,7 +1278,7 @@ function renderWaitOverlay() {
     document.getElementById('waitText').textContent = 'Warte auf Mitspieler …';
     document.getElementById('waitSub').textContent = view.spectator
       ? 'Das Spiel hat noch nicht begonnen – du siehst es, sobald beide Spieler da sind.'
-      : 'Teile den Link oben, damit dein Freund beitreten kann.';
+      : 'Teile den Link oben, damit dein Freund beitreten kann.' + (settingsSummary(view.settings) ? ' Einstellungen: ' + settingsSummary(view.settings) + ' (Vorgabe: du / Gegner). Die Uhr startet, sobald er da ist.' : '');
     overlay.classList.add('visible');
   } else {
     overlay.classList.remove('visible');

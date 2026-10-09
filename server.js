@@ -16,8 +16,9 @@ const { WebSocketServer } = require('ws');
 const R = require('./shared/rules.js');
 const { createStore, serializeState, deserializeState } = require('./persist.js');
 const { createPush, sanitizeSubscription } = require('./push.js');
+const BOT = require('./bot.js');
 
-const VERSION = '2026-10-09.13';
+const VERSION = '2026-10-09.15';
 const PORT = process.env.PORT || 3000;
 const store = createStore();                 // Redis (REST) / Datei / nur Arbeitsspeicher – siehe persist.js
 let push = null;                             // Web-Push (wird beim Start initialisiert)
@@ -95,8 +96,32 @@ function freshRoundState(startPlayerIndex) {
   };
 }
 
-function newGameState() {
-  return { round: 1, scores: [0, 0], log: [], roundHistory: [], ...freshRoundState(0) };
+/* ---------- Raum-Einstellungen: Bedenkzeit (mit Fischer-Bonus) und Vorgabe in Punkten ----------
+ * clock: null = ohne Zeit, sonst { baseMs, incMs } – jeder Spieler hat ein eigenes Zeitkonto fuer das
+ *        GANZE Spiel (wie beim Schach). Nach jedem eigenen Zug gibt es incMs dazu (Fischer).
+ *        Wer bei 0 ankommt, hat das Spiel verloren.
+ * handicap: Startpunkte [Sitz 0 (Ersteller), Sitz 1]. */
+const SETTINGS_DEFAULT = { clock: null, handicap: [0, 0] };
+function sanitizeSettings(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  let clock = null;
+  const min = Number(r.minutes), inc = Number(r.increment);
+  if (Number.isFinite(min) && min > 0) {
+    clock = {
+      baseMs: Math.round(Math.min(180, Math.max(0.5, min)) * 60000),
+      incMs: Math.round(Math.min(120, Math.max(0, Number.isFinite(inc) ? inc : 0)) * 1000)
+    };
+  }
+  const h = Array.isArray(r.handicap) ? r.handicap : [0, 0];
+  const hc = [0, 1].map(i => Math.max(-400, Math.min(450, Math.round(Number(h[i]) || 0))));
+  return { clock, handicap: hc };
+}
+function newGameState(settings) {
+  const st = settings || SETTINGS_DEFAULT;
+  const clock = st.clock
+    ? { baseMs: st.clock.baseMs, incMs: st.clock.incMs, remaining: [st.clock.baseMs, st.clock.baseMs], turnStartedAt: null, runningFor: null }
+    : null;
+  return { round: 1, scores: [st.handicap[0], st.handicap[1]], log: [], roundHistory: [], clock, ...freshRoundState(0) };
 }
 
 /* ---------- Verlauf (Log) ----------
@@ -169,7 +194,8 @@ function serializeRoom(room) {
     code: room.code,
     createdAt: room.createdAt,
     lastActivity: room.lastActivity,
-    seats: room.seats.map(sd => sd && { token: sd.token, name: sd.name, push: sd.push || null }),
+    settings: room.settings || SETTINGS_DEFAULT,
+    seats: room.seats.map(sd => sd && { token: sd.token, name: sd.name, push: sd.push || null, bot: sd.bot || null }),
     state: serializeState(room.state)
   };
 }
@@ -206,10 +232,12 @@ async function restoreRooms() {
       code: d.code,
       // Alle Sitze starten "getrennt"; wer mit seinem Token zurueckkommt, sitzt wieder auf seinem Platz.
       seats: (d.seats || [null, null]).map(sd => sd && {
-        token: sd.token, name: sd.name, ws: null, connected: false, disconnectedAt: Date.now(), push: sd.push || null
+        token: sd.token, name: sd.name, ws: null, connected: !!sd.bot, disconnectedAt: sd.bot ? null : Date.now(),
+        push: sd.push || null, bot: sd.bot || null
       }),
       spectators: new Set(),
-      state: deserializeState(d.state),
+      state: (() => { const st = deserializeState(d.state); if (st.clock) { st.clock.turnStartedAt = null; st.clock.runningFor = null; } return st; })(),
+      settings: d.settings || SETTINGS_DEFAULT,
       createdAt: d.createdAt || Date.now(),
       lastActivity: d.lastActivity || Date.now()
     });
@@ -443,9 +471,10 @@ const actions = {
     }
     hand.splice(hand.findIndex(c => c.id === handCard.id), 1);
     const jokerEntry = meld.cards[jIdx];
-    meld.cards[jIdx] = { card: handCard, addedBy: pid };
+    // Die echte Karte uebernimmt den Platz des Jokers – mit allem, was dazugehoert: Die Punkte zaehlen
+    // weiter fuer den, der den Joker gelegt hat, und die Gruppe wird durch einen Tausch NICHT fixiert.
+    meld.cards[jIdx] = { card: handCard, addedBy: jokerEntry.addedBy };
     if (swapRunStart !== null) meld.runStart = swapRunStart;
-    if (pid !== meld.ownerId) meld.locked = true;
     hand.push(jokerEntry.card);
     s.seenCards.add(R.cardKey(handCard));
     addLog(s, {
@@ -485,6 +514,11 @@ const actions = {
       evaluateRound(room);
     } else {
       advanceTurn(room);
+      // Nachziehstapel leer und zu wenig zum Aufnehmen: niemand kann mehr ziehen -> Runde endet.
+      if (s.drawPile.length === 0 && s.discardPile.length < 2) {
+        addLog(s, 'Der Nachziehstapel ist leer – die Runde endet.');
+        evaluateRound(room);
+      }
     }
   },
 
@@ -524,21 +558,35 @@ const actions = {
     addLog(s, { pid, kind: 'undo', text: `setzt ${n === 1 ? 'die Aktion' : `alle ${n} Aktionen`} dieses Zuges zurück.` });
   },
 
+  /* Aufgeben: das Spiel endet sofort, der Gegner gewinnt. Geht jederzeit (auch wenn man nicht dran ist). */
+  resign(room, pid) {
+    const s = room.state;
+    if (s.roundOver && s.pendingWinner !== null) throw 'Das Spiel ist schon entschieden.';
+    s.resigned = pid;
+    s.pendingWinner = opponentOf(pid);
+    if (!s.roundOver) {
+      s.roundHistory.push({ round: s.round, plus: [0, 0], minus: [0, 0], total: [0, 0], cumulative: [s.scores[0], s.scores[1]] });
+    }
+    s.roundOver = true;
+    s.nextStarter = 0;
+    addLog(s, { pid, kind: 'sys', text: 'gibt auf – das Spiel ist beendet.' });
+  },
+
   nextRound(room) {
     const s = room.state;
     if (!s.roundOver) throw 'Runde laeuft noch.';
     if (s.pendingWinner !== null) {
-      room.state = newGameState();
+      room.state = newGameState(room.settings);
       addLog(room.state, 'Neues Spiel gestartet.');
       return;
     }
-    const carried = { scores: s.scores, log: s.log, roundHistory: s.roundHistory, round: s.round + 1 };
+    const carried = { scores: s.scores, log: s.log, roundHistory: s.roundHistory, round: s.round + 1, clock: s.clock || null };
     room.state = { ...carried, ...freshRoundState(s.nextStarter) };
     addLog(room.state, `Runde ${room.state.round} beginnt.`);
   },
 
   newGame(room) {
-    room.state = newGameState();
+    room.state = newGameState(room.settings);
     addLog(room.state, 'Neues Spiel gestartet.');
   }
 };
@@ -601,10 +649,155 @@ function assertTableOk(s, extra, replaceMeldId) {
     .filter(m => m.id !== replaceMeldId)
     .map(m => ({ cards: m.cards.map(mc => mc.card), runStart: m.runStart }));
   if (extra) melds.push(extra);
-  const problems = R.tableJokerProblems(melds, s.reserveCard, s.discardPile);
+  // Nur NEUE Verstoesse zaehlen: wird z. B. spaeter die echte Karte zu einem Satz-Joker abgeworfen,
+  // darf das nicht jedes weitere (unbeteiligte) Auslegen blockieren.
+  const before = R.tableJokerProblems(s.tableMelds.map(m => ({ cards: m.cards.map(mc => mc.card), runStart: m.runStart })), s.reserveCard, s.discardPile);
+  const problems = R.tableJokerProblems(melds, s.reserveCard, s.discardPile).filter(p => !before.includes(p));
   if (problems.length) {
     throw 'Blockiert: ' + problems[0] + ' – ein Joker kann keine Karte darstellen, die es schon echt gibt.';
   }
+}
+
+/* Fuehrt eine Aktion mit allen Pruefungen aus (Mensch und Computer gleichermassen).
+ * Rueckgabe: null bei Erfolg, sonst die Fehlermeldung. Der Zustand bleibt bei Fehlern unveraendert. */
+function performAction(room, pid, action, payload) {
+  const s = room.state;
+  const fn = actions[action];
+  if (!fn) return 'Unbekannte Aktion.';
+  try {
+    const snap = UNDOABLE.has(action) ? takeSnapshot(s) : null;
+    const logLen = s.log.length;
+    const guard = TABLE_ACTIONS.has(action) && snap;
+    const problemsBefore = guard ? tableProblems(s) : null;
+    const prevCur = s.currentPlayerIndex, prevOver = !!s.roundOver;
+    fn(room, pid, payload || {});
+    // Fischer: Zug beendet (anderer Spieler dran oder Runde vorbei) -> Zeit verbuchen + Bonus
+    if (room.state === s && s.clock && !prevOver && (s.currentPlayerIndex !== prevCur || s.roundOver)) {
+      clockBank(room);
+      if (action !== 'resign') s.clock.remaining[prevCur] += s.clock.incMs;
+    }
+    if (guard) {
+      const fresh = tableProblems(s).filter(p => !problemsBefore.includes(p));
+      if (fresh.length) {
+        s.log.splice(0, s.log.length - logLen); // Verlaufseintraege dieser Aktion entfernen
+        restoreSnapshot(s, snap);
+        throw `Nicht erlaubt: ${fresh[0]}. (Jede Karte gibt es nur einmal, Joker behalten ihre Karte, Gruppen ihre Art.)`;
+      }
+    }
+    if (snap) {
+      // neue Eintraege stehen vorn (neueste zuerst); die eigentliche Aktion ist der AELTESTE davon
+      const added = s.log.length - logLen;
+      const first = added > 0 ? s.log[Math.min(added, s.log.length) - 1] : null;
+      snap.__label = first ? first.text : '';
+      (s.undoStack = s.undoStack || []).push(snap);
+    } else if (!UNDO_ACTIONS.has(action) && room.state) {
+      room.state.undoStack = []; // Ziehen, Abwerfen, neue Runde ... = Zug nicht mehr rueckholbar
+    }
+    return null;
+  } catch (errMsg) {
+    if (typeof errMsg !== 'string') console.error('[aktion]', action, errMsg);
+    return typeof errMsg === 'string' ? errMsg : 'Ungueltiger Zug.';
+  }
+}
+
+/* ============================= COMPUTER-GEGNER =============================
+ * Ist ein Computer am Zug, macht er Schritt fuer Schritt je eine Aktion (mit kleiner Pause,
+ * damit man zusehen kann). Abgelehnte Aktionen merkt er sich fuer diesen Zug. */
+const BOT_STEP_MS = Number(process.env.BOT_STEP_MS || 900);
+function scheduleBot(room) {
+  const s = room.state;
+  if (!s || s.roundOver || room.botTimer || !rooms.has(room.code)) return;
+  const seat = room.seats[s.currentPlayerIndex];
+  if (!seat || !seat.bot) return;
+  room.botTimer = setTimeout(() => { room.botTimer = null; botStep(room); }, BOT_STEP_MS);
+}
+function botStep(room) {
+  const s = room.state;
+  if (!s || s.roundOver || !rooms.has(room.code)) return;
+  const pid = s.currentPlayerIndex;
+  const seat = room.seats[pid];
+  if (!seat || !seat.bot) return;
+  const turn = room.botTurnNo || 0;
+  if (!room.botMemo || room.botMemo.turn !== turn || room.botMemo.state !== s) {
+    room.botMemo = { turn, state: s, failed: new Set(), steps: 0 };
+  }
+  const memo = room.botMemo;
+  let a = null;
+  try { a = BOT.nextAction(s, pid, seat.bot, memo); } catch (e) { console.error('[bot] Entscheidung:', e); }
+  if (++memo.steps > 60) a = null;
+  let err = a ? performAction(room, pid, a.action, a.payload) : 'keine Aktion';
+  if (err && a) {
+    memo.failed.add(JSON.stringify(a));
+    for (let tries = 0; tries < 15 && err; tries++) {
+      try { a = BOT.nextAction(s, pid, seat.bot, memo); } catch (e) { a = null; }
+      if (!a) break;
+      err = performAction(room, pid, a.action, a.payload);
+      if (err) memo.failed.add(JSON.stringify(a));
+    }
+  }
+  if (err) {
+    // Notfall: Zug irgendwie regelkonform beenden
+    const hand = s.players[pid].hand;
+    if (s.needsDraw && !s.skipDrawThisTurn) err = performAction(room, pid, 'draw', {});
+    if (err && hand.length === 1) err = performAction(room, pid, 'endRoundFacedown', {});
+    for (const c of hand.slice()) { if (!err) break; err = performAction(room, pid, 'discard', { cardId: c.id }); }
+    if (err) console.error('[bot] festgefahren in Raum', room.code, err);
+  }
+  if (room.state !== s || s.currentPlayerIndex !== pid || s.roundOver) room.botTurnNo = turn + 1;
+  broadcast(room);
+  notifyAfterAction(room, pid);
+}
+
+/* ============================= BEDENKZEIT =============================
+ * Die Uhr des Spielers am Zug laeuft nur, wenn beide Plaetze besetzt sind und die Runde laeuft
+ * (zwischen den Runden ist Pause). broadcast() ruft clockSync() auf – damit ist sie immer im Takt. */
+function clockLeft(c, i) {
+  let r = c.remaining[i];
+  if (c.turnStartedAt != null && c.runningFor === i) r -= Date.now() - c.turnStartedAt;
+  return r;
+}
+function clockBank(room) {
+  const c = room.state && room.state.clock;
+  if (!c || c.turnStartedAt == null) return;
+  c.remaining[c.runningFor] -= Date.now() - c.turnStartedAt;
+  c.turnStartedAt = null;
+  c.runningFor = null;
+}
+function clearClockTimer(room) { if (room.clockTimer) { clearTimeout(room.clockTimer); room.clockTimer = null; } }
+function clockSync(room) {
+  const s = room.state, c = s && s.clock;
+  if (!c) { clearClockTimer(room); return; }
+  const running = !s.roundOver && room.seats[0] && room.seats[1] && rooms.has(room.code);
+  if (!running) { clockBank(room); clearClockTimer(room); return; }
+  if (c.turnStartedAt != null && c.runningFor !== s.currentPlayerIndex) clockBank(room);
+  if (c.turnStartedAt == null) { c.turnStartedAt = Date.now(); c.runningFor = s.currentPlayerIndex; }
+  clearClockTimer(room);
+  room.clockTimer = setTimeout(() => { room.clockTimer = null; clockCheck(room); }, Math.max(0, clockLeft(c, c.runningFor)) + 60);
+}
+function clockCheck(room) {
+  const s = room.state, c = s && s.clock;
+  if (!c || c.turnStartedAt == null || s.roundOver) return;
+  const i = c.runningFor;
+  if (clockLeft(c, i) > 0) { clockSync(room); return; }
+  clockBank(room);
+  c.remaining[i] = 0;
+  s.timedOut = i;
+  s.pendingWinner = opponentOf(i);
+  s.roundHistory.push({ round: s.round, plus: [0, 0], minus: [0, 0], total: [0, 0], cumulative: [s.scores[0], s.scores[1]] });
+  s.roundOver = true;
+  s.nextStarter = 0;
+  addLog(s, { pid: i, kind: 'sys', text: 'hat keine Zeit mehr – das Spiel ist verloren.' });
+  broadcast(room);
+  notifyPlayer(room, i, 'Pesëqind – Zeit abgelaufen', 'Deine Bedenkzeit ist abgelaufen.');
+}
+function clockView(s) {
+  const c = s.clock;
+  if (!c) return null;
+  return {
+    baseMs: c.baseMs, incMs: c.incMs,
+    remaining: [Math.max(0, clockLeft(c, 0)), Math.max(0, clockLeft(c, 1))],
+    running: c.turnStartedAt != null ? c.runningFor : null
+  };
 }
 
 function label(room, pid) {
@@ -672,6 +865,11 @@ function viewFor(room, pid) {
     myName: (mySeat && mySeat.name) || (pid === 0 ? 'Spieler 1' : 'Spieler 2'),
     oppName: (oppSeat && oppSeat.name) || (opp === 0 ? 'Spieler 1' : 'Spieler 2'),
     opponentConnected: !!(oppSeat && oppSeat.connected),
+    oppIsBot: !!(oppSeat && oppSeat.bot),
+    resigned: s.resigned === undefined ? null : s.resigned,
+    timedOut: s.timedOut === undefined ? null : s.timedOut,
+    clock: clockView(s),
+    settings: room.settings || SETTINGS_DEFAULT,
     round: s.round,
     scores: s.scores,
     currentPlayerIndex: s.currentPlayerIndex,
@@ -706,6 +904,10 @@ function viewForSpectator(room) {
   const a = room.seats[0], b = room.seats[1];
   return {
     spectator: true,
+    resigned: s.resigned === undefined ? null : s.resigned,
+    timedOut: s.timedOut === undefined ? null : s.timedOut,
+    clock: clockView(s),
+    settings: room.settings || SETTINGS_DEFAULT,
     room: room.code,
     myIndex: 0,
     myName: (a && a.name) || 'Spieler 1',
@@ -740,6 +942,7 @@ function viewForSpectator(room) {
 
 function broadcast(room) {
   room.lastActivity = Date.now();
+  clockSync(room);
   room.seats.forEach((seat, pid) => {
     if (seat && seat.ws && seat.ws.readyState === 1) {
       send(seat.ws, { type: 'state', view: viewFor(room, pid) });
@@ -750,6 +953,7 @@ function broadcast(room) {
     room.spectators.forEach(w => { if (w.readyState === 1) send(w, { type: 'state', view: sv }); });
   }
   saveSoon(room);
+  scheduleBot(room);
 }
 
 function send(ws, msg) {
@@ -867,10 +1071,14 @@ wss.on('connection', ws => {
       leaveCurrentSeat();
       lobbyWatchers.delete(ws);
       room = createRoom();
-      room.state = newGameState();
+      room.settings = sanitizeSettings(msg.settings);
+      room.state = newGameState(room.settings);
       pid = 0;
       const token = crypto.randomUUID();
       room.seats[0] = { token, ws, name: cleanName(msg.name, 'Spieler 1'), connected: true };
+      if (msg.bot && BOT.LEVELS[msg.bot]) {
+        room.seats[1] = { token: crypto.randomUUID(), ws: null, name: `CPU (${BOT.LEVELS[msg.bot].name})`, connected: true, bot: msg.bot };
+      }
       send(ws, { type: 'joined', room: room.code, seat: 0, token, vapidPublicKey: push ? push.publicKey : null });
       broadcast(room);
       broadcastRoomList();
@@ -944,41 +1152,16 @@ wss.on('connection', ws => {
       if (!room || pid === null) { send(ws, { type: 'error', code: 'NOT_IN_ROOM', message: 'Nicht in einem Raum.' }); return; }
       if (!room.seats[opponentOf(pid)]) { send(ws, { type: 'error', message: 'Warte auf den zweiten Spieler.' }); return; }
       const s = room.state;
-      const readsOnly = ['nextRound', 'newGame'];
+      const readsOnly = ['nextRound', 'newGame', 'resign'];
       if (!readsOnly.includes(msg.action) && s.currentPlayerIndex !== pid) {
         send(ws, { type: 'error', message: 'Nicht dein Zug.' });
         return;
       }
-      const fn = actions[msg.action];
-      if (!fn) { send(ws, { type: 'error', message: 'Unbekannte Aktion.' }); return; }
-      try {
-        const snap = UNDOABLE.has(msg.action) ? takeSnapshot(s) : null;
-        const logLen = s.log.length;
-        const guard = TABLE_ACTIONS.has(msg.action) && snap;
-        const problemsBefore = guard ? tableProblems(s) : null;
-        fn(room, pid, msg.payload || {});
-        if (guard) {
-          const fresh = tableProblems(s).filter(p => !problemsBefore.includes(p));
-          if (fresh.length) {
-            s.log.splice(0, s.log.length - logLen); // Verlaufseintraege dieser Aktion entfernen
-            restoreSnapshot(s, snap);
-            throw `Nicht erlaubt: ${fresh[0]}. (Jede Karte gibt es nur einmal, Joker behalten ihre Karte, Gruppen ihre Art.)`;
-          }
-        }
-        if (snap) {
-          // neue Eintraege stehen vorn (neueste zuerst); die eigentliche Aktion ist der AELTESTE davon
-          const added = s.log.length - logLen;
-          const first = added > 0 ? s.log[Math.min(added, s.log.length) - 1] : null;
-          snap.__label = first ? first.text : '';
-          (s.undoStack = s.undoStack || []).push(snap);
-        } else if (!UNDO_ACTIONS.has(msg.action) && room.state) {
-          room.state.undoStack = []; // Ziehen, Abwerfen, neue Runde ... = Zug nicht mehr rueckholbar
-        }
-        broadcast(room);
-        notifyAfterAction(room, pid);
-      } catch (errMsg) {
-        send(ws, { type: 'error', message: typeof errMsg === 'string' ? errMsg : 'Ungueltiger Zug.' });
-      }
+      if (room.seats[pid] && room.seats[pid].bot) { send(ws, { type: 'error', message: 'Das ist der Platz des Computers.' }); return; }
+      const err = performAction(room, pid, msg.action, msg.payload || {});
+      if (err) { send(ws, { type: 'error', message: err }); return; }
+      broadcast(room);
+      notifyAfterAction(room, pid);
       return;
     }
   });
@@ -1036,6 +1219,7 @@ async function start() {
     console.error('[persist] Wiederherstellen fehlgeschlagen:', e.message);
   }
   try { push = await createPush({ store }); } catch (e) { console.error('[push] nicht verfuegbar:', e.message); }
+  for (const r of rooms.values()) scheduleBot(r);
   server.listen(PORT, () => console.log(`Pesëqind-Server laeuft auf Port ${PORT}`));
 }
 async function shutdown() {
