@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Pesëqind online</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#2b2024">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Pesëqind">
+<link rel="stylesheet" href="style.css">
+<style>
+  #lobby{
+    position:fixed; inset:0; z-index:3000; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:16px; padding:20px; text-align:center;
+    background:radial-gradient(ellipse at center, #8a4a42, #2b2024 72%);
+  }
+  #lobby.hidden{ display:none; }
+  #lobby h1{ font-family:Georgia,serif; color:var(--gold); font-size:26px; margin:0; }
+  #lobby .card-box{
+    background:var(--panel); border:1px solid var(--panel-edge); border-radius:14px;
+    padding:18px; width:100%; max-width:340px; display:flex; flex-direction:column; gap:10px;
+  }
+  #lobby input{
+    padding:10px 12px; border-radius:9px; border:1px solid var(--panel-edge);
+    background:rgba(0,0,0,.25); color:#f2ede1; font-size:15px; text-align:center;
+    letter-spacing:.12em; text-transform:uppercase;
+  }
+  #lobby .or{ opacity:.5; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+  #lobby .status{ font-size:12.5px; opacity:.8; min-height:16px; }
+  #lobby .status.err{ color:#ffb3ac; }
+  #lobby #nameInput{ text-transform:none; letter-spacing:normal; }
+  .resume-box{
+    display:none; flex-direction:column; gap:8px; background:rgba(211,171,110,.14);
+    border:1px solid var(--gold-dim); border-radius:10px; padding:10px;
+  }
+  .resume-box .resume-text{ font-size:13px; }
+  .room-list-box{ text-align:left; margin-top:2px; }
+  .room-list-title{
+    font-size:10.5px; text-transform:uppercase; letter-spacing:.08em; opacity:.6;
+    margin-bottom:6px;
+  }
+  .room-list-items{
+    display:flex; flex-direction:column; gap:6px; max-height:32vh; overflow-y:auto;
+    -webkit-overflow-scrolling:touch;
+  }
+  .room-list-item{
+    display:flex; justify-content:space-between; align-items:center; gap:8px;
+    padding:9px 11px; border-radius:9px; border:1px solid var(--panel-edge);
+    background:rgba(255,255,255,.05); color:#f2ede1; cursor:pointer; text-align:left;
+    font-size:12.5px; text-transform:none; letter-spacing:normal;
+  }
+  .room-list-item:hover{ background:rgba(211,171,110,.16); }
+  .room-list-item .rl-code{ font-weight:800; color:var(--gold); letter-spacing:.08em; }
+  .room-list-item .rl-info{ opacity:.75; font-size:11px; }
+  .room-list-empty{ font-size:11.5px; opacity:.55; font-style:italic; padding:6px 2px; }
+  #roomBadge{
+    position:fixed; top:8px; left:50%; transform:translateX(-50%); z-index:1500;
+    background:rgba(0,0,0,.35); border:1px solid var(--panel-edge); border-radius:20px;
+    padding:3px 12px; font-size:11px; opacity:.85; display:flex; gap:8px; align-items:center;
+  }
+  #roomBadge button{ background:none; border:none; color:var(--gold); font-size:11px; cursor:pointer; padding:0; }
+  #waitOverlay{
+    position:absolute; inset:0; z-index:2500; display:none; align-items:center; justify-content:center;
+    flex-direction:column; gap:10px; text-align:center; padding:20px;
+    background:radial-gradient(ellipse at center, rgba(43,32,36,.9), rgba(20,14,15,.96) 75%);
+  }
+  #waitOverlay.visible{ display:flex; }
+  #waitOverlay h2{ color:var(--gold); font-family:Georgia,serif; margin:0; font-size:19px; }
+</style>
+</head>
+<body>
+
+<div id="lobby">
+  <h1>Pesëqind</h1>
+  <div class="card-box">
+    <input id="nameInput" maxlength="20" placeholder="Dein Name">
+    <div class="resume-box" id="resumeBox">
+      <div class="resume-text">Weiterspielen in Raum <b id="resumeRoomLabel"></b>?</div>
+      <div style="display:flex; gap:8px;">
+        <button class="action primary" id="btnResume" style="flex:1; padding:10px;">Weiterspielen</button>
+        <button class="action" id="btnForgetRoom" style="flex:1; padding:10px;">Neu starten</button>
+      </div>
+    </div>
+    <button class="action primary" id="btnCreate" style="padding:12px;">Neues Spiel erstellen</button>
+    <div class="or">oder</div>
+    <input id="joinCodeInput" maxlength="4" placeholder="CODE eingeben">
+    <button class="action" id="btnJoin" style="padding:12px;">Raum beitreten</button>
+    <button class="action" id="btnWatch" style="padding:10px; font-size:12.5px; opacity:.85;">👁 Nur zuschauen (mit Code)</button>
+    <div class="status" id="lobbyStatus"></div>
+    <div class="ver-label" style="font-size:10px; opacity:.45;"></div>
+    <div class="room-list-box">
+      <div class="room-list-title">Offene Räume</div>
+      <div class="room-list-items" id="roomListItems">
+        <div class="room-list-empty">Suche Räume …</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="verTag" aria-hidden="true"></div>
+
+<div id="roomBadge" style="display:none;">
+  Raum <b id="roomCodeLabel"></b>
+  <span id="specLabel" style="display:none; color:var(--gold);">👁 Zuschauer</span>
+  <button id="btnCopyLink">Link kopieren</button>
+  <button id="btnCopyWatch" title="Link, mit dem andere nur zuschauen können (sie sehen keine Handkarten)">👁 Zuschauer-Link</button>
+  <span id="specCount"></span>
+</div>
+
+<div id="appRoot">
+  <div id="waitOverlay">
+    <h2 id="waitText">Warte auf Mitspieler …</h2>
+    <p style="opacity:.75; font-size:13px; max-width:320px;" id="waitSub"></p>
+  </div>
+
+  <div id="connStrip"></div>
+
+  <div id="roundOverlay">
+    <div class="ro-inner">
+      <h1 style="color:var(--gold); font-family:Georgia,serif; margin:0;">Runde beendet</h1>
+      <div class="breakdown" id="roundBreakdown"></div>
+      <div class="round-board" id="roundBoard"></div>
+      <div class="ro-footer"><button id="roundContinueBtn">Nächste Runde</button></div>
+    </div>
+  </div>
+
+  <div id="discardPickerOverlay">
+    <h1 id="pickerTitle" style="color:var(--gold); font-size:18px; font-family:Georgia,serif; margin:0;">Wie viele Karten aufnehmen?</h1>
+    <div class="picker-hint" id="pickerHint">Tippe die Karte, ab der aufgenommen wird – diese plus alles rechts davon wandert auf deine Hand. Mindestens 2 Karten.</div>
+    <div class="picker-row" id="pickerRow"></div>
+    <button class="action" style="margin-top:14px;" id="btnCancelPicker">Abbrechen</button>
+  </div>
+
+  <!-- ============ GEGNERSEITE ============ -->
+  <div class="side opp">
+    <div class="side-head">
+      <span class="seat-tag opp">Gegner</span>
+      <span class="hand-badge" id="oppHandBadge">🂠 <b>0</b></span>
+      <span class="banner" id="oppNote"></span>
+    </div>
+    <div class="melds" id="oppMelds"></div>
+  </div>
+
+  <!-- ============ TISCHMITTE ============ -->
+  <div class="center">
+    <div class="piles">
+      <div class="pile-col">
+        <div class="plabel">Nachzieh <b id="drawCount">0</b></div>
+        <div class="deck-back" id="deckBack">🂠</div>
+      </div>
+      <div class="pile-col discard-col">
+        <div class="plabel">Ablage <b id="discardCount">0</b></div>
+        <div class="fan" id="discardFan"></div>
+      </div>
+      <div class="pile-col">
+        <div class="plabel">Rest</div>
+        <div id="reserveSlot"></div>
+      </div>
+    </div>
+    <div class="score-box">
+      <div class="srow opp"><span>Gegner</span><b id="oppScore">0</b></div>
+      <div class="srow me"><span>Du</span><b id="meScore">0</b></div>
+      <div class="menu-row">
+        <button class="mini-btn" id="btnDropHistory">Punkte ▾</button>
+        <button class="mini-btn" id="btnDropLog">Verlauf ▾</button>
+        <button class="mini-btn" id="btnDropMenu">⋯</button>
+      </div>
+      <div class="drop" id="dropHistory">
+        <h4 id="dropHistoryTitle">Punkteverlauf</h4>
+        <table class="history-table" id="historyTable"></table>
+        <div id="tableNow"></div>
+      </div>
+      <div class="drop" id="dropLog">
+        <h4>Verlauf</h4>
+        <div class="log-tools" id="logTools">
+          <button class="mini-btn active" data-f="all">Alles</button>
+          <button class="mini-btn" data-f="table">Nur Tisch (Auslegen · Anlegen · Tausch)</button>
+        </div>
+        <div id="logLines"></div>
+      </div>
+      <div class="drop" id="dropMenu">
+        <h4>Optionen</h4>
+        <button class="action" style="width:100%" id="bigCardsBtn">🔍 Größere Karten</button>
+        <button class="action" style="width:100%; margin-top:6px" id="btnToggleHand">👁 Meine Karten: sichtbar</button>
+        <button class="action" style="width:100%; margin-top:6px" id="btnToggleTrack">📜 Kartennamen im Verlauf: an</button>
+        <button class="action" style="width:100%; margin-top:6px" id="btnToggleNotify">🔔 Ton &amp; Vibration</button>
+        <button class="action" style="width:100%; margin-top:6px" id="btnPush">📲 Push bei geschlossener App</button>
+        <button class="action danger" style="width:100%; margin-top:6px" id="btnLeaveGame">🚪 Spiel verlassen</button>
+        <div class="ver-label" style="font-size:10px; opacity:.45; margin-top:6px; text-align:center;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ MEINE SEITE ============ -->
+  <div class="side me">
+    <div class="melds" id="myMelds"></div>
+    <div class="side-head">
+      <span class="seat-tag me">Du</span>
+      <span class="hand-badge" id="meHandBadge">🂠 <b>0</b></span>
+      <button class="mini-btn eye-btn" id="btnHandEye" title="Eigene Karten verdecken / aufdecken">👁 Karten</button>
+      <button class="mini-btn sort-btn" id="btnSort" title="Hand sortieren: nach Farbe / nach Rang / wie gezogen">↕ Farbe</button>
+      <span class="banner" id="turnBanner"></span>
+    </div>
+    <div class="hand-zone" id="handZone"></div>
+    <div id="actionDock">
+      <div class="controls-row" id="selectionActionRow">
+        <button class="action" id="btnClearSel">Aufheben</button>
+        <button class="action primary" id="btnLaySelection">Auslegen</button>
+      </div>
+      <div class="controls-row" id="undoRow">
+        <button class="action" id="btnUndo">↩ Zug zurück</button>
+        <button class="action" id="btnUndoAll">⟲ Alles zurücksetzen</button>
+      </div>
+      <div class="controls-row" id="drawActionRow">
+        <button class="action primary" id="btnDrawBig">🂠 Karte ziehen</button>
+        <button class="action primary" id="btnPickupBig">📥 Ablage aufnehmen</button>
+      </div>
+      <div class="controls-row">
+        <button class="action" id="btnDiscardSelected">Abwerfen &amp; Zug beenden</button>
+        <button class="action danger" id="btnEndRoundFacedown" disabled>Letzte Karte verdeckt ablegen &amp; Runde beenden</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/shared/rules.js"></script>
+<script src="client.js"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "name": "peshqin-online",
+  "version": "1.0.0",
+  "description": "Pesëqind/500 als Online-Kartenspiel fuer 2 Spieler (Server-Schiedsrichter-Modell)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "web-push": "^3.6.7",
+    "ws": "^8.17.0"
+  }
+}

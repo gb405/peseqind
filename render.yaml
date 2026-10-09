@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: peshqin-online
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      # Dauerhafte Speicherung (Upstash Redis, kostenlos) – Werte im Render-Dashboard eintragen:
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      # Optional: eigene Push-Schluessel (sonst erzeugt der Server welche und legt sie im Speicher ab)
+      # - key: VAPID_PUBLIC_KEY
+      #   sync: false
+      # - key: VAPID_PRIVATE_KEY
+      #   sync: false
